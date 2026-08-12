@@ -187,37 +187,206 @@ async def open_visio_file(file_path: str) -> str:
     except Exception as e:
         return f"Error initializing Visio: {str(e)}"
 
-def _drop_stencil_master(app, page, master_name_u, x, y, width, height):
-    """Try to drop a built-in stencil master (looked up by its locale-independent
-    NameU, which stays stable across Visio language editions) onto the page,
-    sized to (width, height) with its center at (x + width/2, y + height/2).
+# visOpenHidden | visOpenRO. The RO flag is not optional: a stencil opened
+# hidden-but-writable can trigger an invisible "save changes?" dialog on close
+# (e.g. if Visio's autorecovery touches it) that blocks the process forever -
+# this is what caused the multi-minute hangs and eventual crash seen in
+# testing, the same failure class as the original ConnectorToolDataObject bug.
+_VISIO_OPEN_HIDDEN_RO = 64 | 2
 
-    Returns the new Shape, or None if no candidate built-in stencil could be
-    opened, or didn't contain the requested master - callers should fall back
-    to a plain drawn shape in that case rather than fail outright.
+# Per-shape-type search hints: keywords to match against a master's Name/NameU
+# (checked in both, so this works regardless of Visio's UI language), and a
+# short list of built-in stencil filenames known to contain that master,
+# tried first before falling back to scanning every stencil found on disk.
+_MASTER_HINTS = {
+    "Decision": {
+        "keywords": ["decision", "décision"],
+        "preferred_stencils": ["BASFLO_M.VSSX", "BASFLO_U.VSSX"],
+    },
+    "Cylinder": {
+        "keywords": ["database", "base de données", "cylinder", "cylindre", "data store", "magasin de données"],
+        "preferred_stencils": ["ADS_M.VSSX", "ADS_U.VSSX", "BASFLO_M.VSSX", "BASFLO_U.VSSX"],
+    },
+}
+
+# Cache of confirmed working (stencil_ref, matched Name) per master key, so
+# repeat calls for the same shape type skip straight to what already worked
+# instead of re-scanning every stencil on disk each time.
+_master_location_cache: Dict[str, tuple] = {}
+
+
+def _visio_content_roots():
+    """Yield every language subfolder found under Visio's built-in stencil
+    content folders. The stencils themselves live one level down under a
+    language-code folder (e.g. 1036 = French, 1033 = English) - which one
+    exists depends on the installed Office/Visio language, so this scans
+    whatever is actually there rather than assuming one locale.
     """
-    candidates = ["BASIC_U.VSSX", "BASIC_M.VSSX", "BASIC_U.VSS", "BASIC_M.VSS"]
-    for stencil_name in candidates:
+    bases = [
+        r"C:\Program Files\Microsoft Office\root\Office16\Visio Content",
+        r"C:\Program Files (x86)\Microsoft Office\root\Office16\Visio Content",
+    ]
+    for base in bases:
+        if not os.path.isdir(base):
+            continue
+        for entry in os.listdir(base):
+            full = os.path.join(base, entry)
+            if os.path.isdir(full):
+                yield full
+
+
+def _drop_stencil_master(app, page, master_key, x, y, width, height):
+    """Try to drop a built-in stencil master onto the page, sized to
+    (width, height) with its center at (x + width/2, y + height/2).
+
+    master_key looks up _MASTER_HINTS for search keywords and a priority
+    stencil list; a cached (stencil, matched name) from a prior successful
+    call for the same master_key is tried first. Falls back to scanning every
+    stencil found under Visio's content folder(s) if nothing else matches.
+
+    Returns the new Shape, or None if no candidate stencil could be opened /
+    contained a matching master - callers should fall back to a plain drawn
+    shape in that case rather than fail outright.
+    """
+    hint = _MASTER_HINTS.get(master_key, {"keywords": [master_key.lower()], "preferred_stencils": []})
+    keywords = [k.lower() for k in hint["keywords"]]
+    cx, cy = x + width / 2.0, y + height / 2.0
+
+    def try_stencil(stencil_ref):
         stencil_doc = None
         try:
-            stencil_doc = app.Documents.OpenEx(stencil_name, 64)  # 64 = visOpenHidden
-            master = stencil_doc.Masters.ItemU(master_name_u)
-            cx, cy = x + width / 2.0, y + height / 2.0
-            shape = page.Drop(master, cx, cy)
-            shape.CellsU("Width").FormulaU = f"{width} in"
-            shape.CellsU("Height").FormulaU = f"{height} in"
-            shape.CellsU("PinX").FormulaU = f"{cx} in"
-            shape.CellsU("PinY").FormulaU = f"{cy} in"
-            return shape
+            stencil_doc = app.Documents.OpenEx(stencil_ref, _VISIO_OPEN_HIDDEN_RO)
+            for master in stencil_doc.Masters:
+                name, name_u = (master.Name or ""), (master.NameU or "")
+                if any(kw in name.lower() or kw in name_u.lower() for kw in keywords):
+                    # Drop WHILE the stencil is still open: the dropped shape
+                    # is an independent copy on the page, but the Master
+                    # reference itself becomes invalid once its owning
+                    # stencil document is closed.
+                    shape = page.Drop(master, cx, cy)
+                    shape.CellsU("Width").ResultIU = width
+                    shape.CellsU("Height").ResultIU = height
+                    shape.CellsU("PinX").ResultIU = cx
+                    shape.CellsU("PinY").ResultIU = cy
+                    _master_location_cache[master_key] = (stencil_ref, name)
+                    return shape
         except Exception:
-            continue
+            return None
         finally:
             if stencil_doc is not None:
                 try:
                     stencil_doc.Close()
                 except Exception:
                     pass
+        return None
+
+    # 1. Cached hit from a previous successful call.
+    cached = _master_location_cache.get(master_key)
+    if cached:
+        shape = try_stencil(cached[0])
+        if shape is not None:
+            return shape
+
+    # 2. Preferred stencils for this master key.
+    for stencil_name in hint["preferred_stencils"]:
+        shape = try_stencil(stencil_name)
+        if shape is not None:
+            return shape
+
+    # 3. Fall back to every stencil found on disk.
+    seen = set(hint["preferred_stencils"])
+    for root in _visio_content_roots():
+        try:
+            filenames = os.listdir(root)
+        except Exception:
+            continue
+        for fname in filenames:
+            if not fname.upper().endswith((".VSSX", ".VSSM", ".VSS")) or fname in seen:
+                continue
+            seen.add(fname)
+            shape = try_stencil(os.path.join(root, fname))
+            if shape is not None:
+                return shape
+
     return None
+
+@mcp.tool()
+async def find_shape_master(keyword: str, max_stencils: Optional[int] = 25) -> str:
+    """Diagnostic tool: search Visio's installed stencil files on disk for master
+    shapes whose display Name or universal NameU contains the given keyword
+    (case-insensitive, matches in any language - e.g. "magasin" finds the French
+    BPMN "Magasin de donnees" master). Read-only: opens each candidate stencil
+    hidden, inspects it, and closes it again without touching your document.
+
+    Use this to find the exact (stencil_path, name_u) to hand to a future
+    add_shape call when a guessed built-in shape name doesn't match what's
+    actually installed on this machine/Visio version/language.
+
+    Args:
+        keyword: Substring to search for in stencil master names (case-insensitive).
+        max_stencils: Safety cap on how many stencil files to actually open and
+            scan (default 25) - the search can otherwise take a while if a lot
+            of stencils are installed.
+
+    Returns:
+        JSON string: {"scanned_stencils": N, "matches": [{"stencil": path,
+        "name": display name, "name_u": universal name}, ...]}
+    """
+    try:
+        app = get_visio_app()
+
+        search_roots = []
+        try:
+            search_roots.append(app.Path)
+        except Exception:
+            pass
+        search_roots += [
+            r"C:\Program Files\Microsoft Office\root\Office16\Visio Content",
+            r"C:\Program Files (x86)\Microsoft Office\root\Office16\Visio Content",
+        ]
+
+        vssx_files = []
+        seen = set()
+        for root in search_roots:
+            if not root or not os.path.isdir(root):
+                continue
+            for dirpath, _dirs, filenames in os.walk(root):
+                for fn in filenames:
+                    if fn.lower().endswith((".vssx", ".vssm", ".vss")):
+                        full = os.path.join(dirpath, fn)
+                        if full not in seen:
+                            seen.add(full)
+                            vssx_files.append(full)
+
+        keyword_lower = keyword.lower()
+        matches = []
+        scanned = 0
+        for stencil_path in vssx_files:
+            if scanned >= max_stencils:
+                break
+            stencil_doc = None
+            try:
+                stencil_doc = app.Documents.OpenEx(stencil_path, _VISIO_OPEN_HIDDEN_RO)
+                scanned += 1
+                for master in stencil_doc.Masters:
+                    try:
+                        name, name_u = master.Name, master.NameU
+                    except Exception:
+                        continue
+                    if keyword_lower in name.lower() or keyword_lower in name_u.lower():
+                        matches.append({"stencil": stencil_path, "name": name, "name_u": name_u})
+            except Exception:
+                continue
+            finally:
+                if stencil_doc is not None:
+                    try:
+                        stencil_doc.Close()
+                    except Exception:
+                        pass
+
+        return json.dumps({"scanned_stencils": scanned, "matches": matches}, indent=2, ensure_ascii=False)
+    except Exception as e:
+        return f"Error searching for shape master: {str(e)}"
 
 @mcp.tool()
 async def add_shape(file_path: str, shape_type: str, x: float, y: float,
@@ -271,15 +440,23 @@ async def add_shape(file_path: str, shape_type: str, x: float, y: float,
         elif shape_type_lower == "line":
             shape = page.DrawLine(x, y, x + width, y + height)
         elif shape_type_lower in ["diamond", "decision"]:
-            # No native Page.DrawDiamond - build a closed 4-point rhombus by
-            # hand (a proper flowchart decision symbol, not a rotated square).
-            cx, cy = x + width / 2.0, y + height / 2.0
-            pts = (cx, y + height, x + width, cy, cx, y, x, cy, cx, y + height)
-            shape = page.DrawPolyline(pts, False)
+            # Prefer the real flowchart "Decision" master from Visio's
+            # built-in stencils (proper connection points for connectors to
+            # snap to). Fall back to a hand-built closed 4-point rhombus via
+            # Page.DrawPolyline (no native Page.DrawDiamond exists) if no
+            # candidate stencil can be found - always produces a real diamond
+            # rather than a rotated square either way.
+            shape = _drop_stencil_master(app, page, "Decision", x, y, width, height)
+            if shape is None:
+                cx, cy = x + width / 2.0, y + height / 2.0
+                pts = (cx, y + height, x + width, cy, cx, y, x, cy, cx, y + height)
+                shape = page.DrawPolyline(pts, False)
         elif shape_type_lower in ["database", "cylinder", "data store", "datastore"]:
-            # Use the built-in "Cylinder" master from Visio's Basic Shapes
-            # stencil (NameU is stable across language editions). Falls back
-            # to a plain rectangle if no candidate stencil file is found.
+            # Use the built-in "Database"/"Cylinder" master from Visio's
+            # stencils (matched by keyword against Name/NameU, so it works
+            # regardless of UI language - e.g. finds "Magasin de donnees" on
+            # a French install). Falls back to a plain rectangle if no
+            # candidate stencil file is found.
             shape = _drop_stencil_master(app, page, "Cylinder", x, y, width, height)
             if shape is None:
                 shape = page.DrawRectangle(x, y, x + width, y + height)
