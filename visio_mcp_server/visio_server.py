@@ -187,14 +187,49 @@ async def open_visio_file(file_path: str) -> str:
     except Exception as e:
         return f"Error initializing Visio: {str(e)}"
 
+def _drop_stencil_master(app, page, master_name_u, x, y, width, height):
+    """Try to drop a built-in stencil master (looked up by its locale-independent
+    NameU, which stays stable across Visio language editions) onto the page,
+    sized to (width, height) with its center at (x + width/2, y + height/2).
+
+    Returns the new Shape, or None if no candidate built-in stencil could be
+    opened, or didn't contain the requested master - callers should fall back
+    to a plain drawn shape in that case rather than fail outright.
+    """
+    candidates = ["BASIC_U.VSSX", "BASIC_M.VSSX", "BASIC_U.VSS", "BASIC_M.VSS"]
+    for stencil_name in candidates:
+        stencil_doc = None
+        try:
+            stencil_doc = app.Documents.OpenEx(stencil_name, 64)  # 64 = visOpenHidden
+            master = stencil_doc.Masters.ItemU(master_name_u)
+            cx, cy = x + width / 2.0, y + height / 2.0
+            shape = page.Drop(master, cx, cy)
+            shape.CellsU("Width").FormulaU = f"{width} in"
+            shape.CellsU("Height").FormulaU = f"{height} in"
+            shape.CellsU("PinX").FormulaU = f"{cx} in"
+            shape.CellsU("PinY").FormulaU = f"{cy} in"
+            return shape
+        except Exception:
+            continue
+        finally:
+            if stencil_doc is not None:
+                try:
+                    stencil_doc.Close()
+                except Exception:
+                    pass
+    return None
+
 @mcp.tool()
-async def add_shape(file_path: str, shape_type: str, x: float, y: float, 
+async def add_shape(file_path: str, shape_type: str, x: float, y: float,
                     width: Optional[float] = 1.0, height: Optional[float] = 1.0) -> str:
     """Add a shape to an existing Visio document.
     
     Args:
         file_path: Path to the Visio file.
-        shape_type: Type of shape to add (e.g., "Rectangle", "Circle", "Line", etc.).
+        shape_type: Type of shape to add. Supported: "Rectangle", "Circle"/"Ellipse",
+            "Line", "Diamond"/"Decision" (flowchart decision symbol), and
+            "Database"/"Cylinder"/"Data store" (flowchart data-store symbol).
+            Anything else defaults to a rectangle.
         x: X-coordinate for the shape.
         y: Y-coordinate for the shape.
         width: Width of the shape (default: 1.0).
@@ -235,6 +270,19 @@ async def add_shape(file_path: str, shape_type: str, x: float, y: float,
             shape = page.DrawOval(x, y, x + width, y + height)
         elif shape_type_lower == "line":
             shape = page.DrawLine(x, y, x + width, y + height)
+        elif shape_type_lower in ["diamond", "decision"]:
+            # No native Page.DrawDiamond - build a closed 4-point rhombus by
+            # hand (a proper flowchart decision symbol, not a rotated square).
+            cx, cy = x + width / 2.0, y + height / 2.0
+            pts = (cx, y + height, x + width, cy, cx, y, x, cy, cx, y + height)
+            shape = page.DrawPolyline(pts, False)
+        elif shape_type_lower in ["database", "cylinder", "data store", "datastore"]:
+            # Use the built-in "Cylinder" master from Visio's Basic Shapes
+            # stencil (NameU is stable across language editions). Falls back
+            # to a plain rectangle if no candidate stencil file is found.
+            shape = _drop_stencil_master(app, page, "Cylinder", x, y, width, height)
+            if shape is None:
+                shape = page.DrawRectangle(x, y, x + width, y + height)
         else:
             # Default to rectangle if shape type not recognized
             shape = page.DrawRectangle(x, y, x + width, y + height)
@@ -251,16 +299,21 @@ async def add_shape(file_path: str, shape_type: str, x: float, y: float,
         return f"Error adding shape to Visio file: {str(e)}"
 
 @mcp.tool()
-async def connect_shapes(file_path: str, shape1_id: int, shape2_id: int, 
-                        connector_type: Optional[str] = "Dynamic") -> str:
-    """Connect two shapes in a Visio document.
-    
+async def connect_shapes(file_path: str, shape1_id: int, shape2_id: int,
+                        connector_type: Optional[str] = "Curved",
+                        label: Optional[str] = None) -> str:
+    """Connect two shapes in a Visio document. The connector gets an arrowhead
+    at the shape2 end by default, and can carry a text label (e.g. "yes",
+    "reads", "optional") for decision branches or annotated data flows.
+
     Args:
         file_path: Path to the Visio file.
-        shape1_id: ID of the first shape.
-        shape2_id: ID of the second shape.
+        shape1_id: ID of the first shape (arrow starts here).
+        shape2_id: ID of the second shape (arrowhead points here).
         connector_type: Type of connector (options: "Dynamic", "Straight", "Curved").
-    
+            Defaults to "Curved".
+        label: Optional text to place on the connector line.
+
     Returns:
         Result message indicating success or failure.
     """
@@ -320,15 +373,26 @@ async def connect_shapes(file_path: str, shape1_id: int, shape2_id: int,
                     connector = shape
                     break
 
-        connector_type_lower = (connector_type or "dynamic").lower()
-        if connector is not None and connector_type_lower in ("straight", "curved"):
-            connector.CellsU("LinePattern").FormulaU = "0"
-            connector.CellsU("Rounding").FormulaU = "0 mm" if connector_type_lower == "straight" else "5 mm"
+        connector_type_lower = (connector_type or "curved").lower()
+        if connector is not None:
+            if connector_type_lower in ("straight", "curved"):
+                connector.CellsU("LinePattern").FormulaU = "0"
+                connector.CellsU("Rounding").FormulaU = "0 mm" if connector_type_lower == "straight" else "5 mm"
+
+            # Arrowhead pointing from shape1 to shape2. Index 5 = a standard
+            # filled triangular arrow; 0 = no arrowhead.
+            connector.CellsU("BeginArrow").FormulaU = "0"
+            connector.CellsU("EndArrow").FormulaU = "5"
+
+            if label:
+                connector.Text = label
 
         # Save document
         doc.Save()
 
-        return f"Shapes {shape1_id} and {shape2_id} connected successfully with {connector_type} connector"
+        connector_id = connector.ID if connector is not None else "unknown"
+        return (f"Shapes {shape1_id} and {shape2_id} connected successfully with "
+                f"{connector_type} connector (ID {connector_id})")
     except Exception as e:
         return f"Error connecting shapes: {str(e)}"
 
