@@ -1,12 +1,14 @@
-# Visio MCP Server
+# Visio MCP Server (maintained fork)
 
 A MCP server that provides tools for creating and editing Microsoft Visio diagrams programmatically via a standardized API.
 
 ![](https://badge.mcpx.dev?type=server "MCP Server")
 
+> **Fork notice.** This is a fork of [GongRzhe/Office-Visio-MCP-Server](https://github.com/GongRzhe/Office-Visio-MCP-Server), which was archived (read-only) on 2026-03-03. This fork fixes a hang in `connect_shapes` and adds shape coloring — see [Changes in this fork](#changes-in-this-fork) below. All credit for the original design and implementation goes to GongRzhe.
+
 ## Overview
 
-Visio MCP Server allows you to automate Visio diagram creation and editing using Python. It leverages Microsoft's COM interface to control Visio, enabling you to programmatically create diagrams, add shapes, connect them, add text, and more.
+Visio MCP Server allows you to automate Visio diagram creation and editing using Python. It leverages Microsoft's COM interface to control Visio, enabling you to programmatically create diagrams, add shapes, connect them, add text, color them, and more.
 
 ## Example
 
@@ -18,7 +20,7 @@ Visio MCP Server allows you to automate Visio diagram creation and editing using
 - Microsoft Visio (Professional or Standard) installed
 - Python 3.12+
 - Python packages:
-  - `mcp.server`
+  - `mcp==1.29.0` (pinned — see [Changes in this fork](#changes-in-this-fork))
   - `win32com.client` (pywin32)
 
 ## Installation
@@ -27,15 +29,14 @@ Visio MCP Server allows you to automate Visio diagram creation and editing using
 2. Install required Python packages:
 
 ```bash
-pip install pywin32
-pip install mcp-server
+pip install -r requirements.txt
 ```
 
 3. Clone or download this repository
 4. Run the server:
 
 ```bash
-python visio_mcp_server.py
+python visio_mcp_server/visio_server.py
 ```
 
 ## Features
@@ -43,13 +44,14 @@ python visio_mcp_server.py
 The server provides the following functionality:
 
 ### Creating and Opening Files
-- Create new Visio diagrams
+- Create new Visio diagrams (with a page sized for multi-shape diagrams — see below)
 - Open existing Visio diagrams
 
 ### Shape Management
 - Add various shapes (Rectangle, Circle, Line, etc.)
 - Connect shapes with different connector types
 - Add text to shapes
+- Set shape fill and line color
 - List all shapes in a document
 
 ### File Operations
@@ -59,34 +61,17 @@ The server provides the following functionality:
 
 ## MCP Configuration
 
-### Option 1: Local Python Server
+### Local Python Server
 
 Add the server to your MCP settings configuration file:
 
 ```json
 {
   "mcpServers": {
-    "ppt": {
-      "command": "python",
-      "args": ["/path/to/ppt_mcp_server.py"],
+    "visio": {
+      "command": "C:\\path\\to\\.venv\\Scripts\\python.exe",
+      "args": ["C:\\path\\to\\visio_mcp_server\\visio_server.py"],
       "env": {}
-    }
-  }
-}
-```
-
-### Option 2: Using UVX (No Local Installation Required)
-
-If you have `uvx` installed, you can run the server directly from PyPI without local installation:
-
-```json
-{
-  "mcpServers": {
-    "ppt": {
-      "command": "uvx",
-      "args": [
-        "--from", "office-visio-mcp-server", "visio_mcp_server"
-      ]
     }
   }
 }
@@ -101,13 +86,6 @@ Creates a new Visio diagram.
 {
   "template_path": "[optional] Path to Visio template (.vstx, .vst)",
   "save_path": "[optional] Where to save the file"
-}
-```
-
-Example:
-```json
-{
-  "save_path": "C:\\Users\\YourUsername\\Documents\\MyDiagram.vsdx"
 }
 ```
 
@@ -135,7 +113,7 @@ Adds a shape to a Visio diagram.
 ```
 
 ### Connect Shapes
-Connects two shapes in a Visio diagram.
+Connects two shapes in a Visio diagram, by ID.
 
 ```json
 {
@@ -157,6 +135,20 @@ Adds text to a shape in a Visio diagram.
 }
 ```
 
+### Set Shape Color *(new in this fork)*
+Sets the fill and/or line color of a shape.
+
+```json
+{
+  "file_path": "Path to the Visio file",
+  "shape_id": 1,
+  "fill_color": "#DBEAFE",
+  "line_color": "#2563EB"
+}
+```
+
+Both `fill_color` and `line_color` are optional hex strings (with or without the leading `#`); pass at least one.
+
 ### List Shapes
 Lists all shapes in a Visio diagram.
 
@@ -166,119 +158,25 @@ Lists all shapes in a Visio diagram.
 }
 ```
 
-## Usage Example
+## Changes in this fork
 
-Here's a complete workflow example:
+### Fixed: `connect_shapes` hung indefinitely (~4 minute timeout, every call)
 
-1. Create a new Visio file:
-```json
-{
-  "save_path": "C:\\Diagrams\\FlowChart.vsdx"
-}
-```
+The original implementation built a connector via `app.ConnectorToolDataObject` + `page.Drop(...)` — this simulates an interactive drag-and-drop of Visio's Connector Tool. In unattended MCP automation (no real mouse driving the drag), this call blocks and eventually times out, with no visible dialog to explain why.
 
-2. Add a rectangle shape:
-```json
-{
-  "file_path": "C:\\Diagrams\\FlowChart.vsdx",
-  "shape_type": "Rectangle",
-  "x": 2.0,
-  "y": 2.0,
-  "width": 1.5,
-  "height": 1.0
-}
-```
+**Fix:** use [`Page.AutoConnectMany`](https://learn.microsoft.com/en-us/office/vba/api/visio.page.autoconnectmany), the documented, code-driven API for connecting shapes by ID. It doesn't depend on `ActiveWindow.Selection` or any drag simulation, and returns immediately.
 
-3. Add another shape:
-```json
-{
-  "file_path": "C:\\Diagrams\\FlowChart.vsdx",
-  "shape_type": "Circle",
-  "x": 5.0,
-  "y": 2.0,
-  "width": 1.0,
-  "height": 1.0
-}
-```
+### Fixed: new diagrams used the default page size, shapes ended up outside the page frame
 
-4. Get shape IDs:
-```json
-{
-  "file_path": "C:\\Diagrams\\FlowChart.vsdx"
-}
-```
+A default new Visio document uses a small default page (Letter/A4-sized). A flowchart with more than a handful of shapes quickly exceeds that, and shapes get placed outside the visible page frame. `create_visio_file` now sets a generous page size (60in × 90in) on creation.
 
-5. Connect the shapes:
-```json
-{
-  "file_path": "C:\\Diagrams\\FlowChart.vsdx",
-  "shape1_id": 1,
-  "shape2_id": 2,
-  "connector_type": "Straight"
-}
-```
+### Added: `set_shape_color`
 
-6. Add text to shapes:
-```json
-{
-  "file_path": "C:\\Diagrams\\FlowChart.vsdx",
-  "shape_id": 1,
-  "text": "Start"
-}
-```
+The original README listed "Color and fill pattern customization" under Future Features. This fork adds a `set_shape_color` tool (fill + line color, hex input) using `Shape.CellsU("FillForegnd")` / `Shape.CellsU("LineColor")`.
 
-## Future Features
+### Pinned `mcp==1.29.0`
 
-The following features are planned for future releases:
-
-### Enhanced Shape Styling
-- Color and fill pattern customization
-- Line weight, style, and color options
-- Text formatting (font, size, alignment)
-- Shadow and 3D effects
-
-### Advanced Visio Objects
-- Support for layers and pages
-- Group creation and manipulation
-- Container management
-- Text-only shapes and callouts
-
-### Template Management
-- Template library access
-- Custom template creation
-- Favorite templates list
-
-### Batch Operations
-- Bulk shape creation
-- Mass formatting changes
-- Import from CSV/JSON data sources
-
-### Custom Stencil Support
-- Loading custom stencils
-- Creating and saving custom stencils
-- Searching stencil shapes
-
-### Diagram Analysis
-- Shape relationship analysis
-- Path finding between shapes
-- Validation against diagram rules
-
-### Export Options
-- PDF export with options
-- SVG export for web use
-- PNG/JPG with custom resolution
-- Export specific pages or sections
-
-### Integration Capabilities
-- REST API wrapper
-- Webhook support for diagram changes
-- Version control integration
-- CI/CD pipeline support
-
-### Headless Operation
-- Server operation without visible Visio UI
-- Background diagram processing
-- Scheduled operations
+`requirements.txt` originally specified `mcp>=1.2.0` with no upper bound. `mcp` 2.0.0 renamed/restructured `mcp.server.fastmcp`, which this server imports directly — installing latest breaks the import (`ModuleNotFoundError`). Pinned to the last 1.x release.
 
 ## Troubleshooting
 
@@ -300,8 +198,9 @@ The following features are planned for future releases:
    - Restarting Visio manually may help resolve COM interface issues
    - Ensure no existing Visio processes are hanging in Task Manager
 
+5. **Automating over SSH / a non-interactive session**:
+   - Visio's COM server needs a real interactive Windows session to initialize. Launching the MCP server (or any script that touches `win32com.client.Dispatch("Visio.Application")`) from a non-interactive SSH/service session fails (`RPC failed`) even though the same code works fine when the MCP client (e.g. Claude Desktop) runs in the interactive session itself.
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
-
+This project is licensed under the MIT License - see the LICENSE file for details. Original work Copyright (c) 2025 GongRzhe.

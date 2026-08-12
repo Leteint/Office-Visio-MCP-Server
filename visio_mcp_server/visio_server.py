@@ -128,7 +128,16 @@ async def create_visio_file(template_path: Optional[str] = None, save_path: Opti
             
             # Wait for document to initialize
             time.sleep(1)
-            
+
+            # Default page size is too small for multi-shape flowcharts (shapes
+            # end up drawn outside the page frame). Give it generous room.
+            try:
+                page_sheet = doc.Pages.Item(1).PageSheet
+                page_sheet.CellsU("PageWidth").FormulaU = "60 in"
+                page_sheet.CellsU("PageHeight").FormulaU = "90 in"
+            except Exception:
+                pass  # non-fatal - proceed with default page size if this fails
+
             # Save the document
             doc.SaveAs(save_path)
             
@@ -283,29 +292,42 @@ async def connect_shapes(file_path: str, shape1_id: int, shape2_id: int,
         
         if not shape1 or not shape2:
             return f"Error: Could not find shapes with IDs {shape1_id} and {shape2_id}"
-        
-        # Create connector based on type
+
+        # Page.AutoConnectMany(FromShapeIDs, ToShapeIDs, PlacementDirs, [Connector])
+        # is the documented, code-driven way to connect shapes by ID:
+        # https://learn.microsoft.com/en-us/office/vba/api/visio.page.autoconnectmany
+        # The previous implementation used app.ConnectorToolDataObject + page.Drop(),
+        # which simulates an interactive drag-and-drop of the Connector Tool - this
+        # hangs in unattended automation (observed: consistent ~4min timeout, no
+        # visible dialog). AutoConnectMany avoids UI-drag simulation and ActiveWindow
+        # selection state entirely.
+        before_ids = {s.ID for s in page.Shapes}
+
+        # visAutoConnectDirNone = 0 - connect without relocating the existing shapes
+        # (they're already positioned by add_shape calls).
+        connected_count = page.AutoConnectMany([shape1_id], [shape2_id], [0])
+
+        if connected_count == 0:
+            return f"Error: AutoConnectMany could not connect shapes {shape1_id} and {shape2_id}"
+
+        after_ids = {s.ID for s in page.Shapes}
+        new_ids = after_ids - before_ids
         connector = None
-        connector_type_lower = connector_type.lower()
-        
-        if connector_type_lower == "straight":
-            connector = page.Drop(app.ConnectorToolDataObject, 0, 0)
-            connector.Cells("LinePattern").Formula = "0"
-            connector.Cells("Rounding").Formula = "0 mm"
-        elif connector_type_lower == "curved":
-            connector = page.Drop(app.ConnectorToolDataObject, 0, 0)
-            connector.Cells("LinePattern").Formula = "0"
-            connector.Cells("Rounding").Formula = "5 mm"
-        else:  # Default to Dynamic
-            connector = page.Drop(app.ConnectorToolDataObject, 0, 0)
-        
-        # Connect shapes
-        connector.Cells("BeginX").GlueTo(shape1.Cells("PinX"))
-        connector.Cells("EndX").GlueTo(shape2.Cells("PinX"))
-        
+        if new_ids:
+            new_id = next(iter(new_ids))
+            for shape in page.Shapes:
+                if shape.ID == new_id:
+                    connector = shape
+                    break
+
+        connector_type_lower = (connector_type or "dynamic").lower()
+        if connector is not None and connector_type_lower in ("straight", "curved"):
+            connector.CellsU("LinePattern").FormulaU = "0"
+            connector.CellsU("Rounding").FormulaU = "0 mm" if connector_type_lower == "straight" else "5 mm"
+
         # Save document
         doc.Save()
-        
+
         return f"Shapes {shape1_id} and {shape2_id} connected successfully with {connector_type} connector"
     except Exception as e:
         return f"Error connecting shapes: {str(e)}"
@@ -357,6 +379,72 @@ async def add_text(file_path: str, shape_id: int, text: str) -> str:
         return f"Text added to shape {shape_id} successfully"
     except Exception as e:
         return f"Error adding text to shape: {str(e)}"
+
+@mcp.tool()
+async def set_shape_color(file_path: str, shape_id: int, fill_color: Optional[str] = None,
+                          line_color: Optional[str] = None) -> str:
+    """Set the fill and/or line color of a shape in a Visio document.
+
+    Args:
+        file_path: Path to the Visio file.
+        shape_id: ID of the shape to color.
+        fill_color: Fill color as a hex string, e.g. "#DBEAFE" or "DBEAFE" (optional).
+        line_color: Outline/stroke color as a hex string, e.g. "#2563EB" (optional).
+
+    Returns:
+        Result message indicating success or failure.
+    """
+    def hex_to_rgb_formula(hex_color: str) -> str:
+        h = hex_color.strip().lstrip("#")
+        if len(h) != 6:
+            raise ValueError(f"Invalid hex color: {hex_color!r} (expected 6 hex digits)")
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return f"RGB({r},{g},{b})"
+
+    try:
+        # Ensure Visio is running
+        app = get_visio_app()
+
+        # If file is not open, try to open it
+        if file_path not in open_documents:
+            open_result = await open_visio_file(file_path)
+            if "Error" in open_result:
+                return f"Cannot set shape color - file could not be opened: {open_result}"
+
+        # Get the document
+        doc = open_documents[file_path]
+
+        # Get the active page
+        page = app.ActivePage
+
+        # Find shape by ID
+        target_shape = None
+        for shape in page.Shapes:
+            if shape.ID == shape_id:
+                target_shape = shape
+                break
+
+        if not target_shape:
+            return f"Error: Could not find shape with ID {shape_id}"
+
+        if fill_color is None and line_color is None:
+            return "Error: Provide at least one of fill_color or line_color"
+
+        applied = []
+        if fill_color is not None:
+            target_shape.CellsU("FillForegnd").FormulaU = hex_to_rgb_formula(fill_color)
+            target_shape.CellsU("FillPattern").FormulaU = "1"  # solid fill
+            applied.append(f"fill={fill_color}")
+        if line_color is not None:
+            target_shape.CellsU("LineColor").FormulaU = hex_to_rgb_formula(line_color)
+            applied.append(f"line={line_color}")
+
+        # Save document
+        doc.Save()
+
+        return f"Shape {shape_id} colored successfully ({', '.join(applied)})"
+    except Exception as e:
+        return f"Error setting shape color: {str(e)}"
 
 @mcp.tool()
 async def list_shapes(file_path: str) -> str:
